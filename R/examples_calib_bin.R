@@ -1,6 +1,8 @@
 library(tidyverse)
-# biblioteca para alguns metodos de calibracao
+# biblioteca para alguns metodos de calibracao em classificacao binaria
 library(CalibratR)
+library(grid)
+library(ggpubr)
 
 # dados simulados
 set.seed(1250)
@@ -124,9 +126,8 @@ library(data.table)
 library(tm)
 library(glmnet)
 # por enquanto usando setwd
-setwd("~/estatistica_UFSCAR/Doutorado/scripts_test_R")
 
-dados <-  fread("Reviews.csv",
+dados <-  fread("data/Reviews.csv",
                 header = TRUE,
                 nrows = 5000) |>
   mutate(score_fat = ifelse(Score >= 4, 1, 0))
@@ -215,13 +216,51 @@ mce(predito_lasso[, 1],
     dados$score_fat[split == "Teste"], nbins = 50) |>
   round(3)
 
+# melhorando o lasso
+predito_treino <-  predict(vc_lasso, s = vc_lasso$lambda.min,
+                          newx = dtm.matrix[split=="Treinamento",],
+                          type = "response")[, 1]
+
+hist_bin <- CalibratR:::build_hist_binning(dados$score_fat[split == "Treinamento"], 
+                                           predito_treino, 
+                                           bins = 50)
+pred_bin <- CalibratR:::predict_hist_binning(hist_bin, predito_lasso[, 1])
+
+reliab_plot(pred_bin$predictions, dados$score_fat[split == "Teste"])
+ece(pred_bin$predictions, dados$score_fat[split == "Teste"])
+mce(pred_bin$predictions, dados$score_fat[split == "Teste"])
+
+# isoreg
+iso_reg <- isoreg(predito_treino, 
+                  dados$score_fat[split == "Treinamento"]) |> as.stepfun()
+plot(isoreg(predito_treino, dados$score_fat[split == "Treinamento"]))
+pred_iso <- iso_reg(predito_lasso[, 1])
+
+p2 <- reliab_plot(pred_iso, dados$score_fat[split == "Teste"], 
+                  title = "Isotonic Regression")
+ece(pred_iso, test_data$y)
+mce(pred_iso, test_data$y)
+
+# platt
+valid_dados <- dados[split == "Validacao", ] |>
+  mutate(g_x = predict(vc_lasso, s = vc_lasso$lambda.min,
+                       newx = dtm.matrix[split=="Validacao",],
+                       type = "response")[, 1])
+
+h <- glm(score_fat ~ g_x, data = valid_dados, family = "binomial")
+
+pred_platt <- predict(h,
+                      dados[split == "Teste", ] |>
+                        mutate(g_x = predito_lasso[, 1]),
+                      type = "response")
+
+reliab_plot(pred_platt, dados$score_fat[split == "Teste"], 
+            title = "Platt Scaling")
+ece(pred_platt, dados$score_fat[split == "Teste"])
+mce(pred_platt, test_data$y)
 
 
-
-
-
-
-# exemplo simulado --------------------------------------------------------
+# exemplo simulado para o rick--------------------------------------------------------
 set.seed(1250)
 ntrain <- 5000
 nvalid <- 2000
@@ -243,7 +282,6 @@ test_data <- data.frame(x = X_test,
 test_data |> glimpse()
 
 # dados da validacao
-
 sim_valid <- data.frame(x = X_valid,
                         p_y = prob_y(X_valid)) |>
   mutate(y = rbinom(length(X_valid), 1, p_y))
@@ -255,6 +293,19 @@ mod_rf <- ranger::ranger(y ~ x, data = sim_train, probability = TRUE)
 
 # formato da probabilidade real versus estimado no treino
 x_grid <- seq(-1, 1, 0.01)
+data.frame(x = x_grid,
+           p_y = prob_y(x_grid)) |>
+  ggplot(aes(x = x, y = p_y)) +
+  geom_line() +
+  theme_bw() +
+  labs(y = "P(Y = 1|x)",
+       x = "x")
+ggsave("prob_sim.pdf",
+       path = "figures",
+       width = 6,
+       height = 4)
+
+
 plot(x_grid,
      prob_y(x_grid),
      type = "l",
@@ -274,7 +325,10 @@ valid_pred <- predict(mod_rf,
 
 # diagrama de confianca para o modelo nao calibrado
 reliab_plot(pred_rf, test_data$y)
-ggsave()
+ggsave("reliab_plot_uncalibrated.pdf",
+       path = "figures",
+       width = 6,
+       height = 4)
 
 
 # ECE e MCE
@@ -288,7 +342,7 @@ hist_bin <- CalibratR:::build_hist_binning(sim_train$y,
                                            bins = 50)
 pred_bin <- CalibratR:::predict_hist_binning(hist_bin, pred_rf)
 
-reliab_plot(pred_bin$predictions, test_data$y)
+p1 <- reliab_plot(pred_bin$predictions, test_data$y, title = "Histogram Binning")
 ece(pred_bin$predictions, test_data$y)
 mce(pred_bin$predictions, test_data$y)
 
@@ -311,18 +365,19 @@ lines(x_grid, CalibratR:::predict_hist_binning(hist_bin, predict(mod_rf,
 
 # isotonic regression
 iso_reg <- isoreg(mod_rf$predictions[, 2], sim_train$y) |> as.stepfun()
+plot(isoreg(mod_rf$predictions[, 2], sim_train$y))
 pred_iso <- iso_reg(pred_rf)
 
-reliab_plot(pred_iso, test_data$y, nbins = 70)
-ece(pred_iso, test_data$y, nbins = 70)
-mce(pred_iso, test_data$y, nbins = 70)
+p2 <- reliab_plot(pred_iso, test_data$y, title = "Isotonic Regression")
+ece(pred_iso, test_data$y)
+mce(pred_iso, test_data$y)
 
 
 # BBQ
 bbq <- CalibratR:::build_BBQ(sim_valid$y, valid_pred)
 pred_bbq <- CalibratR:::predict_BBQ(bbq, pred_rf, option = 1)
 
-reliab_plot(pred_bbq$predictions, test_data$y)
+p3 <- reliab_plot(pred_bbq$predictions, test_data$y, title = "BBQ")
 ece(pred_bbq$predictions, test_data$y)
 mce(pred_bbq$predictions, test_data$y)
 
@@ -349,7 +404,7 @@ pred_platt <- predict(h,
                       mutate(g_x = pred_rf),
                       type = "response")
 
-reliab_plot(pred_platt, test_data$y)
+p4 <- reliab_plot(pred_platt, test_data$y, title = "Platt Scaling")
 ece(pred_platt, test_data$y)
 mce(pred_platt, test_data$y)
 
@@ -357,11 +412,11 @@ mce(pred_platt, test_data$y)
 # todas as medidas em tabela
 ece_s <- map_dbl(list(pred_rf, pred_bin$predictions, pred_iso, pred_bbq$predictions,
       pred_platt),
-    function(.x){ece(.x, test_data$y, nbins = 70)})
+    function(.x){ece(.x, test_data$y, nbins = 50)})
 
 mce_s <- map_dbl(list(pred_rf, pred_bin$predictions, pred_iso, pred_bbq$predictions,
                     pred_platt),
-               function(.x){mce(.x, test_data$y, nbins = 70)})
+               function(.x){mce(.x, test_data$y, nbins = 50)})
 
 data_ece <- data.frame(mod = c("uncalibrated",
                                "hist bin",
@@ -372,3 +427,120 @@ data_ece <- data.frame(mod = c("uncalibrated",
          mce = mce_s)
 
 data_ece |> glimpse()
+
+# graficos
+figure <- ggpubr::ggarrange(p1 + rremove("ylab") + rremove("xlab"), 
+                    p2 + rremove("ylab") + rremove("xlab"), 
+                    p3 + rremove("ylab") + rremove("xlab"), 
+                    p4+ rremove("ylab") + rremove("xlab"),
+                    labels = NULL,
+                    ncol = 2, nrow = 2,
+                    common.legend = TRUE, legend = "bottom",
+                    align = "hv", 
+                    font.label = list(size = 10, color = "black", face = "bold", family = NULL, position = "top"))
+
+annotate_figure(figure, left = textGrob("Calibration Function", rot = 90, vjust = 1, gp = gpar(cex = 1.3)),
+                bottom = textGrob("Probability Estimate", gp = gpar(cex = 1.3)))
+ggsave("reliab_plots_calibrated.pdf",
+       path = "figures",
+       width = 10,
+       height = 6)
+
+
+# exemplo similar ao de vaicenavicius(2019) -------------------------------------
+set.seed(100)
+ntrain <- 5000
+nvalid <- 2000
+ntest <- 2000
+
+# dados
+sets <- c("train" = ntrain,
+          "valid" = nvalid,
+          "test" = ntest) |>
+  map(rbinom, size = 1, prob = 0.5) |>
+  map(function(.x){data.frame(y = .x) |>
+      mutate(x = rnorm(length(.x), 1*(.x == 1) - 1*(.x == 0), sd = 1))})
+
+# pred nao calibrada
+logis_mod <- function(x, beta_0, beta_1){
+  1/(1 + exp(-(beta_0 + beta_1*x)))
+}
+
+# modelo nao calibrado
+sets <- sets |> map(function(.x){.x |>
+    mutate(logis = logis_mod(x, 1, 1))})
+
+train <- sets |> pluck("train")
+valid <- sets |> pluck("valid")
+test <-  sets |> pluck("test")
+
+# vendo descalibracao no teste
+reliab_plot(test$logis, test$y)
+
+
+# ece e mce
+ece(test$logis, test$y)
+mce(test$logis, test$y)
+
+# arrumando agora com hist binning e outros metodos
+# histogram binning
+hist_bin <- CalibratR:::build_hist_binning(train$y, 
+                                           train$logis, 
+                                           bins = 50)
+pred_bin <- CalibratR:::predict_hist_binning(hist_bin, test$logis)
+
+p1 <- reliab_plot(pred_bin$predictions, test$y, title = "Histogram Binning")
+ece(pred_bin$predictions, test$y)
+mce(pred_bin$predictions, test$y)
+
+
+# isotonic regression
+iso_reg <- isoreg(train$logis, train$y) |> as.stepfun()
+pred_iso <- iso_reg(test$logis)
+
+p2 <- reliab_plot(pred_iso, test$y, title = "Isotonic Regression")
+ece(pred_iso, test$y)
+mce(pred_iso, test$y)
+
+
+# BBQ
+bbq <- CalibratR:::build_BBQ(train$y, train$logis)
+pred_bbq <- CalibratR:::predict_BBQ(bbq, test$logis, option = 1)
+
+p3 <- reliab_plot(pred_bbq$predictions, test$y, title = "BBQ")
+ece(pred_bbq$predictions, test$y)
+mce(pred_bbq$predictions, test$y)
+
+# platt
+h <- glm(y ~ logis, data = valid, family = "binomial")
+
+pred_platt <- predict(h,
+                      test,
+                      type = "response")
+
+p4 <- reliab_plot(pred_platt, test$y, title = "Platt Scaling")
+ece(pred_platt, test$y)
+mce(pred_platt, test$y)
+
+# figuras
+figure <- ggpubr::ggarrange(p1 + rremove("ylab") + rremove("xlab"), 
+                            p2 + rremove("ylab") + rremove("xlab"), 
+                            p3 + rremove("ylab") + rremove("xlab"), 
+                            p4+ rremove("ylab") + rremove("xlab"),
+                            labels = NULL,
+                            ncol = 2, nrow = 2,
+                            common.legend = TRUE, legend = "bottom",
+                            align = "hv", 
+                            font.label = list(size = 10, color = "black", face = "bold", family = NULL, position = "top"))
+
+annotate_figure(figure, left = textGrob("Calibration Function", rot = 90, vjust = 1, gp = gpar(cex = 1.3)),
+                bottom = textGrob("Probability Estimate", gp = gpar(cex = 1.3)))
+
+ggsave("reliab_plots_calibrated_sim2.pdf",
+       path = "figures",
+       width = 10,
+       height = 6)
+
+
+
+
