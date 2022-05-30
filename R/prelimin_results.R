@@ -3,10 +3,11 @@
 library(tidyverse)
 library(ggpubr)
 library(CalibratR)
+
 set.seed(1250)
 ntrain <- 5000
 nvalid <- 3000
-ntest <- 3000
+ntest <- 30000
 prob_y <- function(x){x^2}
 
 sets <- c("train" = ntrain,
@@ -35,8 +36,11 @@ reliab_plot <- function(preds, resp, nbins = 50, title = ""){
     map_dfr(~bin_data |>
               filter(pred_bin <= .x & pred_bin > (.x - b_m))|>
               summarise(acc = mean((resp_bin == 1)),
-                        conf = mean(pred_bin)) |>
-              mutate(gap = abs(acc - conf)) |>
+                        conf = mean(pred_bin),
+                        n = n(),
+                        se = (sqrt(0.5*(1 - 0.5)/n))/(sqrt(n))) |>
+              mutate(gap = abs(acc - conf),
+                     gap_2 = (acc - conf)^2) |>
               mutate(lim_sup =.x))
   
   plot <- bins_stats |>
@@ -44,8 +48,8 @@ reliab_plot <- function(preds, resp, nbins = 50, title = ""){
     geom_point(colour = "dodgerblue3",
                alpha = 0.5) +
     geom_line(colour = "dodgerblue3") +
-    geom_linerange(aes(x = conf, ymin = conf, 
-                       ymax = acc), width = .01)+
+    geom_errorbar(aes(ymin = acc - 2*se, ymax = acc + 2*se), 
+                  width = 0.2)+
     geom_abline(intercept = 0,
                 linetype = "dashed",
                 colour = "red") +
@@ -107,27 +111,27 @@ brier_score <- function(prob_estim, ground_truth){
 
 sim_a_calib <- function(train, valid, test, nbins = 50){
   # training random forest model
-  g_x <- ranger::ranger(y ~ x, 
-                        data = train,
-                        classification = TRUE,
-                        probability = TRUE)
-  
-  # test and validation predictions
-  test <- test %>% mutate(g_x = predict(g_x, test,
-                                       type = "response")$predictions[, 2],
-                          split = case_when(x >= -1 & x < -0.5 ~ "1",
-                                            x >= -0.5 & x < 0 ~ "2",
-                                            x >= 0 & x < 0.5 ~ "3",
-                                            x >= 0.5 & x <= 1 ~ "4"))
+    g_x <- ranger::ranger(y ~ x, 
+                          data = train,
+                          classification = TRUE,
+                          probability = TRUE)
     
-  
-  valid <- valid |> mutate(g_x = predict(g_x, valid,
-                                       type = "response")$predictions[, 2],
-                           split = case_when(x >= -1 & x < -0.5 ~ "1",
-                                             x >= -0.5 & x < 0 ~ "2",
-                                             x >= 0 & x < 0.5 ~ "3",
-                                             x >= 0.5 & x <= 1 ~ "4"))
-  
+    # test and validation predictions
+    test <- test %>% mutate(split = case_when(x >= -1 & x < -0.5 ~ "1",
+                                              x >= -0.5 & x < 0 ~ "2",
+                                              x >= 0 & x < 0.5 ~ "3",
+                                              x >= 0.5 & x <= 1 ~ "4"),
+                            g_x = predict(g_x, test,
+                                          type = "response")$predictions[, 2])
+      
+    
+    valid <- valid |> mutate(split = case_when(x >= -1 & x < -0.5 ~ "1",
+                                               x >= -0.5 & x < 0 ~ "2",
+                                               x >= 0 & x < 0.5 ~ "3",
+                                               x >= 0.5 & x <= 1 ~ "4"),
+                             g_x = predict(g_x, valid,
+                                           type = "response")$predictions[, 2])
+    
   # calibrating predictions using the validation set
   # by platt
   h_x <- glm(y ~ g_x, 
@@ -142,51 +146,67 @@ sim_a_calib <- function(train, valid, test, nbins = 50){
   pred_bin <- CalibratR:::predict_hist_binning(hist_bin, 
                                                test$g_x)$predictions
   
+  # updating test set with calibrated predictions
+  test_glob <- test |>
+    mutate(pred_bin = pred_bin,
+           pred_platt = pred_platt)
+  
   # plotting all into 4 reliability plot
   # dividing test set A-intervals and then using map
-  plot_list <- test |>
-    mutate(split = case_when(x >= -1 & x < -0.5 ~ "1",
-                             x >= -0.5 & x < 0 ~ "2",
-                             x >= 0 & x < 0.5 ~ "3",
-                             x >= 0.5 & x <= 1 ~ "4"), 
-           pred_bin = pred_bin,
-           pred_platt = pred_platt) |>
+  plot_list_glob <- test_glob |>
     group_by(split) |>
     group_split(split) |>
     map_dfr(function(.x){
-      p1 <- reliab_plot(.x$g_x, .x$y) |> 
+      p1 <- reliab_plot(.x$g_x, .x$y, nbins = nbins) |> 
         pluck("bins_stats") |> 
         mutate(mod = "Uncalibrated")
-      p2 <- reliab_plot(.x$pred_bin, .x$y) |> 
+      p2 <- reliab_plot(.x$pred_bin, .x$y, nbins = nbins) |> 
         pluck("bins_stats") |> 
         mutate(mod = "HB")
-      p3 <- reliab_plot(.x$pred_platt, .x$y) |> 
+      p3 <- reliab_plot(.x$pred_platt, .x$y, nbins = nbins) |> 
         pluck("bins_stats") |> 
         mutate(mod = "Platt")
       bind_rows(p1, p2 ,p3) |> mutate(partition = unique(.x$split))})
   
-  plot_1 <- plot_list |>
+  plot_glob <- plot_list_glob |>
+    mutate(partition = case_when(partition == "1" ~ "A1",
+                                 partition == "2" ~ "A2",
+                                 partition == "3" ~ "A3",
+                                 partition == "4" ~ "A4")) |>
     ggplot(aes(x = conf, y = acc)) +
-    geom_point(colour = "dodgerblue3",
-               alpha = 0.5) +
-    geom_line(colour = "dodgerblue3") +
-    geom_linerange(aes(x = conf, ymin = conf, 
-                       ymax = acc), width = .01)+
+    geom_errorbar(aes(ymin = acc - 2*se, ymax = acc + 2*se), 
+                  width = 0.01)+
+    geom_point(colour = "dodgerblue3", alpha = 0.75) +
+    geom_line(colour = "dodgerblue3", alpha = 0.75) +
     geom_abline(intercept = 0,
                 linetype = "dashed",
                 colour = "red") +
     theme_bw()+
-    scale_x_continuous(breaks = scales::pretty_breaks(8),
-                       limits = c(-0.05,1.05))+
-    scale_y_continuous(breaks = scales::pretty_breaks(8),
-                       limits = c(-0.05,1.05)) +
+    scale_x_continuous(breaks = scales::pretty_breaks(8))+
+    scale_y_continuous(breaks = scales::pretty_breaks(8)) +
+    coord_cartesian(xlim = c(-0.05,1.05),
+                    ylim = c(-0.05,1.05)) +
     facet_grid(row = vars(mod), col = vars(partition)) +
     labs(y = "Calibration Function",
          x = "Probability estimate")
   
-  # performing local calibration
+  # computing squared loss for each global method
+  loss_glob <- test_glob |> 
+    pivot_longer(g_x:pred_platt,
+                 names_to = "metodo",
+                 values_to = "predicoes") |>
+    group_by(metodo) |>
+    summarise(sqrd_loss = mean((predicoes - p_y)^2))
+  
+  # computing weighted average of gaps using se
+  gap_glob <- plot_list_glob |>
+    group_by(mod, partition) |>
+    mutate(norm_se = (1/se)/sum(1/se)) |>
+    summarise(average_gap = mean(norm_se*gap_2, na.rm = TRUE))
+  
+  # performing and assessing local calibration
   # by platt
-  h_x <- glm(y ~ g_x + split, 
+  h_x <- glm(y ~ g_x*split, 
              data = valid, 
              family = "binomial")
   
@@ -202,39 +222,68 @@ sim_a_calib <- function(train, valid, test, nbins = 50){
   
   # plotting reliability plots the same way as before
   # dividing test set A-intervals and then using map
-  plot_list <- test |>
+  test_loc <- test |>
     mutate(pred_loc_bin = pred_loc_bin,
-           pred_loc_platt = pred_loc_platt) |>
+           pred_loc_platt = pred_loc_platt)
+  
+  plot_list_loc <- test_loc |>
     group_by(split) |>
     group_split(split) |>
     map_dfr(function(.x){
-      p1 <- reliab_plot(.x$pred_loc_bin, .x$y) |> 
+      p1 <- reliab_plot(.x$g_x, .x$y, nbins = nbins) |> 
+        pluck("bins_stats") |> 
+        mutate(mod = "Uncalibrated")
+      p2 <- reliab_plot(.x$pred_loc_bin, .x$y, nbins = nbins) |> 
         pluck("bins_stats") |> 
         mutate(mod = "HB")
-      p2 <- reliab_plot(.x$pred_loc_platt, .x$y) |> 
+      p3 <- reliab_plot(.x$pred_loc_platt, .x$y, nbins = nbins) |> 
         pluck("bins_stats") |> 
         mutate(mod = "Platt")
-      bind_rows(p1, p2) |> mutate(partition = unique(.x$split))})
+      bind_rows(p1, p2, p3) |> mutate(partition = unique(.x$split))})
   
-  plot_1 <- plot_list |>
+  plot_loc <- plot_list_loc |>
+    mutate(partition = case_when(partition == "1" ~ "A1",
+                                partition == "2" ~ "A2",
+                                partition == "3" ~ "A3",
+                                partition == "4" ~ "A4")) |>
     ggplot(aes(x = conf, y = acc)) +
-    geom_point(colour = "dodgerblue3",
-               alpha = 0.5) +
-    geom_line(colour = "dodgerblue3") +
-    geom_linerange(aes(x = conf, ymin = conf, 
-                       ymax = acc), width = .01)+
+    geom_errorbar(aes(ymin = acc - 2*se, ymax = acc + 2*se), 
+                  width = 0.01)+
+    geom_point(colour = "dodgerblue3", alpha = 0.75) +
+    geom_line(colour = "dodgerblue3", alpha = 0.75) +
     geom_abline(intercept = 0,
                 linetype = "dashed",
                 colour = "red") +
     theme_bw()+
-    scale_x_continuous(breaks = scales::pretty_breaks(8),
-                       limits = c(-0.05,1.05))+
-    scale_y_continuous(breaks = scales::pretty_breaks(8),
-                       limits = c(-0.05,1.05)) +
+    scale_x_continuous(breaks = scales::pretty_breaks(8))+
+    scale_y_continuous(breaks = scales::pretty_breaks(8)) +
+    coord_cartesian(ylim = c(-0.05,1.05),
+                    xlim = c(-0.05,1.05)) +
     facet_grid(row = vars(mod), col = vars(partition)) +
     labs(y = "Calibration Function",
          x = "Probability estimate")
   
+  # computing squared loss for each local method
+  loss_loc <- test_loc |> 
+    pivot_longer(g_x:pred_loc_platt,
+                 names_to = "metodo",
+                 values_to = "predicoes") |>
+    group_by(metodo) |>
+    summarise(sqrd_loss = mean((predicoes - p_y)^2))
+  
+  gap_loc <- plot_list_loc |>
+    group_by(mod, partition) |>
+    mutate(norm_se = (1/se)/sum(1/se)) |>
+    summarise(average_gap = mean(norm_se*gap_2, na.rm = TRUE))
+  
+  return(list("Global Plot" = plot_glob,
+              "Global Stats" = plot_list_glob,
+              "Global Loss" = loss_glob,
+              "Global Gap" = gap_glob,
+              "Local Plot" = plot_loc,
+              "Local Stats" = plot_list_loc,
+              "Local Loss" = loss_loc,
+              "Local Gap" = gap_loc))
 }
 
 loc_hist_binning <- function(valid_data, bins){
@@ -250,7 +299,7 @@ loc_hist_binning <- function(valid_data, bins){
 }
 
 
-predict_loc_hist <- function(loc_hist_obj, part, preds){
+predict_loc_hist <- function(loc_hist_obj,part, preds){
   1:length(preds) |>
     map_dbl(function(.x){
       CalibratR:::predict_hist_binning(loc_hist_obj |> pluck(
@@ -259,3 +308,8 @@ predict_loc_hist <- function(loc_hist_obj, part, preds){
         
     })
 }
+
+
+plots <- sim_a_calib(train, valid, test, nbins = 20)
+
+
